@@ -5,7 +5,7 @@ Transfer learning pipeline for classifying retinal OCT (Optical Coherence Tomogr
 > CNV • DME • DRUSEN • NORMAL
 
 This repository contains the training, evaluation and simple inference scripts used for experimenting with the OCT2017 retinal dataset.
-
+The pre-trained model file vgg16_bn-6c64b313.pth is shared by the link https://drive.google.com/file/d/1asCNcKLiEDx2RpWHAijaj-x1VxGs76pB/view?usp=sharing
 ---
 
 ## Project Structure
