@@ -13,11 +13,33 @@ import time
 import os
 import copy
 
+# ---------- Extra metrics (sklearn) ----------
+try:
+    from sklearn.metrics import (
+        confusion_matrix,
+        classification_report,
+        precision_score,
+        recall_score,
+        f1_score,
+        log_loss,
+        roc_curve,
+        auc,
+        roc_auc_score,
+    )
+    from sklearn.preprocessing import label_binarize
+except ImportError as e:
+    raise ImportError(
+        "This script needs scikit-learn for the requested metrics/ROC/AUC. "
+        "Please install it first, e.g. `pip install scikit-learn`, then rerun."
+    ) from e
+
 plt.ion()
 
 use_gpu = torch.cuda.is_available()
 if use_gpu:
     print("Using CUDA")
+
+device = torch.device("cuda" if use_gpu else "cpu")
 
 data_dir = 'OCT2017_'
 TRAIN = 'train'
@@ -28,8 +50,6 @@ TEST = 'test'
 data_transforms = {
     TRAIN: transforms.Compose([
         # Data augmentation is a good practice for the train set
-        # Here, we randomly crop the image to 224x224 and
-        # randomly flip it horizontally.
         transforms.RandomResizedCrop(224),
         transforms.RandomRotation(degrees=15),
         transforms.ColorJitter(brightness=0.2, contrast=0.2, saturation=0.2, hue=0.2),
@@ -56,6 +76,8 @@ image_datasets = {
     for x in [TRAIN, VAL, TEST]
 }
 
+# NOTE: keeping your original settings; if you want deterministic evaluation,
+# you can set shuffle=False for VAL/TEST.
 dataloaders = {
     x: torch.utils.data.DataLoader(
         image_datasets[x], batch_size=32,
@@ -71,20 +93,22 @@ for x in [TRAIN, VAL, TEST]:
 
 print("Classes: ")
 class_names = image_datasets[TRAIN].classes
-print(image_datasets[TRAIN].classes)
+print(class_names)
+
 
 def imshow(inp, title=None):
     inp = inp.numpy().transpose((1, 2, 0))
-    # plt.figure(figsize=(10, 10))
     plt.axis('off')
     plt.imshow(inp)
     if title is not None:
         plt.title(title)
     plt.pause(0.001)
 
+
 def show_databatch(inputs, classes):
     out = torchvision.utils.make_grid(inputs)
     imshow(out, title=[class_names[x] for x in classes])
+
 
 # Get a batch of training data
 inputs, classes = next(iter(dataloaders[TRAIN]))
@@ -131,55 +155,223 @@ def visualize_model(vgg, num_images=6):
     vgg.train(mode=was_training)  # Revert model back to original training state
 
 
-def eval_model(vgg, criterion):
-    since = time.time()
-    avg_loss = 0
-    avg_acc = 0
-    loss_test = 0
-    acc_test = 0
+def _safe_div(n, d):
+    return float(n) / float(d) if d != 0 else 0.0
 
-    test_batches = len(dataloaders[TEST])
-    print("Evaluating model")
+
+def _specificity_from_cm(cm):
+    """Compute per-class specificity for multi-class confusion matrix."""
+    n_classes = cm.shape[0]
+    total = cm.sum()
+    specs = []
+    for i in range(n_classes):
+        tp = cm[i, i]
+        fn = cm[i, :].sum() - tp
+        fp = cm[:, i].sum() - tp
+        tn = total - tp - fn - fp
+        specs.append(_safe_div(tn, tn + fp))
+    return np.array(specs, dtype=float)
+
+
+def get_predictions(vgg, dataloader):
+    """Collect y_true, y_pred, y_prob (softmax) for a given dataloader."""
+    vgg.eval()
+
+    all_labels = []
+    all_preds = []
+    all_probs = []
+
+    with torch.no_grad():
+        for inputs, labels in dataloader:
+            inputs = inputs.to(device)
+            labels = labels.to(device)
+
+            outputs = vgg(inputs)
+            probs = torch.softmax(outputs, dim=1)
+            _, preds = torch.max(probs, 1)
+
+            all_labels.append(labels.cpu().numpy())
+            all_preds.append(preds.cpu().numpy())
+            all_probs.append(probs.cpu().numpy())
+
+            del inputs, labels, outputs, probs, preds
+            torch.cuda.empty_cache()
+
+    y_true = np.concatenate(all_labels) if all_labels else np.array([])
+    y_pred = np.concatenate(all_preds) if all_preds else np.array([])
+    y_prob = np.concatenate(all_probs) if all_probs else np.array([])
+
+    return y_true, y_pred, y_prob
+
+
+def plot_roc_curves(y_true, y_prob, class_names, title_prefix="Test"):
+    """Plot one-vs-rest ROC curves for multi-class classification."""
+    n_classes = len(class_names)
+    if n_classes <= 1:
+        print("ROC/AUC requires at least 2 classes. Skipping plot.")
+        return
+
+    # Binarize labels for OvR ROC
+    classes = list(range(n_classes))
+    y_true_bin = label_binarize(y_true, classes=classes)
+
+    fpr = {}
+    tpr = {}
+    roc_auc = {}
+
+    for i in range(n_classes):
+        # Guard against missing positives for a class
+        if y_true_bin[:, i].sum() == 0:
+            fpr[i], tpr[i], roc_auc[i] = None, None, None
+            continue
+        fpr[i], tpr[i], _ = roc_curve(y_true_bin[:, i], y_prob[:, i])
+        roc_auc[i] = auc(fpr[i], tpr[i])
+
+    # Micro-average
+    try:
+        fpr["micro"], tpr["micro"], _ = roc_curve(y_true_bin.ravel(), y_prob.ravel())
+        roc_auc["micro"] = auc(fpr["micro"], tpr["micro"])
+    except Exception:
+        roc_auc["micro"] = None
+
+    plt.figure()
+    for i, name in enumerate(class_names):
+        if fpr.get(i) is None:
+            continue
+        plt.plot(fpr[i], tpr[i], label=f"{name} (AUC = {roc_auc[i]:.4f})")
+
+    if roc_auc.get("micro") is not None:
+        plt.plot(fpr["micro"], tpr["micro"], label=f"micro-average (AUC = {roc_auc['micro']:.4f})")
+
+    plt.plot([0, 1], [0, 1], linestyle='--')
+    plt.xlim([0.0, 1.0])
+    plt.ylim([0.0, 1.05])
+    plt.xlabel('False Positive Rate')
+    plt.ylabel('True Positive Rate')
+    plt.title(f"{title_prefix} ROC Curves")
+    plt.legend(loc="lower right")
+    plt.show()
+
+
+def eval_model(vgg, criterion, split=TEST, plot_roc=True):
+    """Evaluate model with extended metrics on the given split."""
+    since = time.time()
+
+    dataloader = dataloaders[split]
+    dataset_size = len(dataloader.dataset)
+
+    print(f"Evaluating model on {split}")
     print('-' * 10)
 
-    for i, data in enumerate(dataloaders[TEST]):
-        if i % 100 == 0:
-            print("\rTest batch {}/{}".format(i, test_batches), end='', flush=True)
+    vgg.eval()
+    running_loss = 0.0
 
-        vgg.train(False)
-        vgg.eval()
-        inputs, labels = data
+    with torch.no_grad():
+        for i, data in enumerate(dataloader):
+            inputs, labels = data
+            inputs = inputs.to(device)
+            labels = labels.to(device)
 
-        if use_gpu:
-            inputs, labels = Variable(inputs.cuda()), Variable(labels.cuda())
-        else:
-            inputs, labels = Variable(inputs), Variable(labels)
+            outputs = vgg(inputs)
+            loss = criterion(outputs, labels)
 
-        outputs = vgg(inputs)
+            running_loss += loss.item() * inputs.size(0)
 
-        _, preds = torch.max(outputs.data, 1)
-        loss = criterion(outputs, labels)
+            del inputs, labels, outputs
+            torch.cuda.empty_cache()
 
-        loss_test += loss.item()
-        acc_test += torch.sum(preds == labels.data)
+    avg_loss = running_loss / dataset_size if dataset_size else 0.0
 
-        del inputs, labels, outputs, preds
-        torch.cuda.empty_cache()
+    # Collect predictions/probabilities for metrics
+    y_true, y_pred, y_prob = get_predictions(vgg, dataloader)
 
-    avg_loss = loss_test / dataset_sizes[TEST]
-    avg_acc = acc_test / dataset_sizes[TEST]
+    # Basic metrics
+    accuracy = (y_pred == y_true).mean() if y_true.size else 0.0
+    precision_macro = precision_score(y_true, y_pred, average='macro', zero_division=0)
+    recall_macro = recall_score(y_true, y_pred, average='macro', zero_division=0)
+    f1_macro = f1_score(y_true, y_pred, average='macro', zero_division=0)
+
+    # Confusion matrix
+    cm = confusion_matrix(y_true, y_pred, labels=list(range(len(class_names))))
+
+    # Sensitivity == Recall per class
+    recall_per_class = recall_score(y_true, y_pred, average=None, zero_division=0)
+    sensitivity_per_class = recall_per_class
+
+    # Specificity per class
+    specificity_per_class = _specificity_from_cm(cm)
+
+    # Log loss (multi-class)
+    try:
+        ll = log_loss(y_true, y_prob, labels=list(range(len(class_names))))
+    except Exception:
+        ll = float('nan')
+
+    # AUC (multi-class OvR)
+    try:
+        auc_macro = roc_auc_score(y_true, y_prob, multi_class='ovr', average='macro')
+        auc_weighted = roc_auc_score(y_true, y_prob, multi_class='ovr', average='weighted')
+    except Exception:
+        auc_macro, auc_weighted = float('nan'), float('nan')
 
     elapsed_time = time.time() - since
+
     print()
     print("Evaluation completed in {:.0f}m {:.0f}s".format(elapsed_time // 60, elapsed_time % 60))
-    print("Avg loss (test): {:.4f}".format(avg_loss))
-    print("Avg acc (test): {:.4f}".format(avg_acc))
+    print(f"Avg loss ({split}): {avg_loss:.4f}")
+    print(f"Classification accuracy ({split}): {accuracy:.4f}")
+    print()
+    print("Confusion matrix:")
+    print(cm)
+    print()
+
+    print("Precision (macro): {:.4f}".format(precision_macro))
+    print("Recall (macro): {:.4f}".format(recall_macro))
+    print("F1 score (macro): {:.4f}".format(f1_macro))
+    print("Log loss: {}".format(f"{ll:.4f}" if not np.isnan(ll) else "nan"))
+    print()
+
+    # Per-class sensitivity/specificity
+    print("Per-class Sensitivity (Recall):")
+    for name, val in zip(class_names, sensitivity_per_class):
+        print(f"  {name}: {val:.4f}")
+
+    print("Per-class Specificity:")
+    for name, val in zip(class_names, specificity_per_class):
+        print(f"  {name}: {val:.4f}")
+
+    print()
+    print("Classification report:")
+    print(classification_report(y_true, y_pred, target_names=class_names, zero_division=0))
+
+    print(f"AUC (macro, OvR): {auc_macro if not np.isnan(auc_macro) else 'nan'}")
+    print(f"AUC (weighted, OvR): {auc_weighted if not np.isnan(auc_weighted) else 'nan'}")
     print('-' * 10)
+
+    # Plot ROC curves
+    if plot_roc and y_true.size and len(class_names) > 1:
+        plot_roc_curves(y_true, y_prob, class_names, title_prefix=split.capitalize())
+
+    return {
+        "loss": avg_loss,
+        "accuracy": accuracy,
+        "precision_macro": precision_macro,
+        "recall_macro": recall_macro,
+        "f1_macro": f1_macro,
+        "log_loss": ll,
+        "confusion_matrix": cm,
+        "sensitivity_per_class": sensitivity_per_class,
+        "specificity_per_class": specificity_per_class,
+        "auc_macro": auc_macro,
+        "auc_weighted": auc_weighted,
+    }
+
 
 # Load the pretrained model from pytorch
 vgg16 = models.vgg16_bn()
-vgg16.load_state_dict(torch.load("vgg16bn/vgg16_bn-6c64b313.pth"))
-print(vgg16.classifier[6].out_features) # 1000
+# Your original path is kept
+vgg16.load_state_dict(torch.load("vgg16bn/vgg16_bn-6c64b313.pth", map_location=device))
+print(vgg16.classifier[6].out_features)  # 1000
 
 
 # Freeze training for all layers
@@ -188,9 +380,9 @@ for param in vgg16.features.parameters():
 
 # Newly created modules have require_grad=True by default
 num_features = vgg16.classifier[6].in_features
-features = list(vgg16.classifier.children())[:-1] # Remove last layer
-features.extend([nn.Linear(num_features, len(class_names))]) # Add our layer with 4 outputs
-vgg16.classifier = nn.Sequential(*features) # Replace the model classifier
+features = list(vgg16.classifier.children())[:-1]  # Remove last layer
+features.extend([nn.Linear(num_features, len(class_names))])  # Add our layer with outputs = num classes
+vgg16.classifier = nn.Sequential(*features)  # Replace the model classifier
 print(vgg16)
 
 # If you want to train the model for more than 2 epochs, set this to True after the first run
@@ -198,11 +390,10 @@ resume_training = False
 
 if resume_training:
     print("Loading pretrained model..")
-    vgg16.load_state_dict(torch.load('vgg16-transfer-learning-pytorch/VGG16_v2-OCT_Retina.pt'))
+    vgg16.load_state_dict(torch.load('vgg16-transfer-learning-pytorch/VGG16_v2-OCT_Retina.pt', map_location=device))
     print("Loaded!")
 
-if use_gpu:
-    vgg16.cuda()  # .cuda() will move everything to the GPU side
+vgg16 = vgg16.to(device)
 
 criterion = nn.CrossEntropyLoss()
 
@@ -210,9 +401,9 @@ optimizer_ft = optim.SGD(vgg16.parameters(), lr=0.0001, momentum=0.9)
 exp_lr_scheduler = lr_scheduler.StepLR(optimizer_ft, step_size=12, gamma=0.1)
 
 print("Test before training")
-eval_model(vgg16, criterion)
+eval_model(vgg16, criterion, split=TEST, plot_roc=True)
 
-visualize_model(vgg16) #test before training
+visualize_model(vgg16)  # test before training
 
 
 def train_model(vgg, criterion, optimizer, scheduler, num_epochs=10):
@@ -220,93 +411,86 @@ def train_model(vgg, criterion, optimizer, scheduler, num_epochs=10):
     best_model_wts = copy.deepcopy(vgg.state_dict())
     best_acc = 0.0
 
-    avg_loss = 0
-    avg_acc = 0
-    avg_loss_val = 0
-    avg_acc_val = 0
-
     train_batches = len(dataloaders[TRAIN])
     val_batches = len(dataloaders[VAL])
 
     for epoch in range(num_epochs):
         train_dataset_length = len(dataloaders[TRAIN].dataset)
         print(f"Length of training dataset: {train_dataset_length}")
-        print("Epoch {}/{}".format(epoch, num_epochs))
+        print("Epoch {}/{}".format(epoch + 1, num_epochs))
         print('-' * 10)
 
-        loss_train = 0
-        loss_val = 0
+        loss_train = 0.0
+        loss_val = 0.0
         acc_train = 0
         acc_val = 0
 
+        # ---- Train ----
         vgg.train(True)
 
         for i, data in enumerate(dataloaders[TRAIN]):
             if i % 100 == 0:
-                print("\rTraining batch {}/{}".format(i, int(train_batches)), end='', flush=True)
+                print("\rtraining batch {}/{}".format(i, int(train_batches)), end='', flush=True)
 
             inputs, labels = data
-
-            if use_gpu:
-                inputs, labels = Variable(inputs.cuda()), Variable(labels.cuda())
-            else:
-                inputs, labels = Variable(inputs), Variable(labels)
+            inputs = inputs.to(device)
+            labels = labels.to(device)
 
             optimizer.zero_grad()
 
             outputs = vgg(inputs)
-
-            _, preds = torch.max(outputs.data, 1)
+            probs = torch.softmax(outputs, dim=1)
+            _, preds = torch.max(probs, 1)
             loss = criterion(outputs, labels)
 
             loss.backward()
             optimizer.step()
 
-            loss_train += loss.item()
-            acc_train += torch.sum(preds == labels.data)
+            loss_train += loss.item() * inputs.size(0)
+            acc_train += torch.sum(preds == labels.data).item()
 
-            del inputs, labels, outputs, preds
+            del inputs, labels, outputs, probs, preds
             torch.cuda.empty_cache()
 
         print()
-        # * 2 as we only used half of the dataset
-        avg_loss = loss_train / len(dataloaders[TRAIN].dataset)
-        avg_acc = acc_train / len(dataloaders[TRAIN].dataset)
+        avg_loss_train = loss_train / len(dataloaders[TRAIN].dataset)
+        avg_acc_train = acc_train / len(dataloaders[TRAIN].dataset)
 
+        # ---- Val ----
         vgg.train(False)
         vgg.eval()
 
-        for i, data in enumerate(dataloaders[VAL]):
-            if i % 100 == 0:
-                print("\rValidation batch {}/{}".format(i, val_batches), end='', flush=True)
+        with torch.no_grad():
+            for i, data in enumerate(dataloaders[VAL]):
+                if i % 100 == 0:
+                    print("\rValidation batch {}/{}".format(i, val_batches), end='', flush=True)
 
-            inputs, labels = data
+                inputs, labels = data
+                inputs = inputs.to(device)
+                labels = labels.to(device)
 
-            if use_gpu:
-                inputs, labels = Variable(inputs.cuda()), Variable(labels.cuda())
-            else:
-                inputs, labels = Variable(inputs), Variable(labels)
+                outputs = vgg(inputs)
+                probs = torch.softmax(outputs, dim=1)
+                _, preds = torch.max(probs, 1)
+                loss = criterion(outputs, labels)
 
-            optimizer.zero_grad()
+                loss_val += loss.item() * inputs.size(0)
+                acc_val += torch.sum(preds == labels.data).item()
 
-            outputs = vgg(inputs)
-
-            _, preds = torch.max(outputs.data, 1)
-            loss = criterion(outputs, labels)
-
-            loss_val += loss.item()
-            acc_val += torch.sum(preds == labels.data)
-
-            del inputs, labels, outputs, preds
-            torch.cuda.empty_cache()
+                del inputs, labels, outputs, probs, preds
+                torch.cuda.empty_cache()
 
         avg_loss_val = loss_val / len(dataloaders[VAL].dataset)
         avg_acc_val = acc_val / len(dataloaders[VAL].dataset)
 
+        # scheduler step per epoch
+        if scheduler is not None:
+            scheduler.step()
+
         print()
-        print("Epoch {} result: ".format(epoch))
-        print("Avg loss (train): {:.4f}".format(avg_loss))
-        print("Avg acc (train): {:.4f}".format(avg_acc))
+        print("Epoch {} result: ".format(epoch + 1))
+        print("Avg loss (train): {:.4f}".format(avg_loss_train))
+        print("Avg acc (train): {:.4f}".format(avg_acc_train))
         print("Avg loss (val): {:.4f}".format(avg_loss_val))
         print("Avg acc (val): {:.4f}".format(avg_acc_val))
         print('-' * 10)
@@ -318,15 +502,20 @@ def train_model(vgg, criterion, optimizer, scheduler, num_epochs=10):
 
     elapsed_time = time.time() - since
     print()
-    print("Training completed in {:.0f}m {:.0f}s".format(elapsed_time // 60, elapsed_time % 60))
-    print("Best acc: {:.4f}".format(best_acc))
+    print("training completed in {:.0f}m {:.0f}s".format(elapsed_time // 60, elapsed_time % 60))
+    print("Best acc (val): {:.4f}".format(best_acc))
 
     vgg.load_state_dict(best_model_wts)
     return vgg
 
-vgg16 = train_model(vgg16, criterion, optimizer_ft, exp_lr_scheduler, num_epochs=10)
-torch.save(vgg16.state_dict(), 'VGG16_OCT_Retina_trained_model.pt')
-# 1.跑到96%
 
-eval_model(vgg16, criterion)
+vgg16 = train_model(vgg16, criterion, optimizer_ft, exp_lr_scheduler, num_epochs=10)
+
+# Save trained weights
+torch.save(vgg16.state_dict(), 'VGG16_OCT_Retina_trained_model.pt')
+
+# Evaluate after training with full metrics + ROC/AUC
+metrics_out = eval_model(vgg16, criterion, split=TEST, plot_roc=True)
+
+# Optional: visualize more predictions
 visualize_model(vgg16, num_images=32)
