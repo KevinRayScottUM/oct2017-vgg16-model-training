@@ -376,7 +376,7 @@ print(vgg16.classifier[6].out_features)  # 1000
 
 # Freeze training for all layers
 for param in vgg16.features.parameters():
-    param.requires_grad = True
+    param.requires_grad = False
 
 # Newly created modules have require_grad=True by default
 num_features = vgg16.classifier[6].in_features
@@ -519,3 +519,4 @@ metrics_out = eval_model(vgg16, criterion, split=TEST, plot_roc=True)
 
 # Optional: visualize more predictions
 visualize_model(vgg16, num_images=32)
+
